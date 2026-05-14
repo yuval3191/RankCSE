@@ -129,6 +129,12 @@ class ModelArguments:
             "help": "Coefficient used to weight ranking distillation loss"
         }
     )
+    distillation_lambda: float = field(
+        default=1.0,
+        metadata={
+            "help": "Lambda for CoSENT-style ranking penalty (chain_triangulation loss)."
+        }
+    )
 
 
     # SimCSE's arguments

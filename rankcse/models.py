@@ -108,6 +108,71 @@ class ListMLE(nn.Module):
 
         return self.gamma_ * torch.mean(torch.sum(observation_loss, dim=1))
 
+
+class ChainTriangulationDistillation(nn.Module):
+    """
+    Cross-anchor triangulation ranking distillation.
+
+    For each anchor i in the batch:
+      View A: teacher ranks all other sentences relative to anchor i
+      View C: teacher ranks all other sentences relative to a cross-anchor c
+              (the sentence ranked LAST by teacher for anchor i)
+
+    Both views rank the same candidate set. We reorder the student's
+    similarities to match View A's coordinate space, compute pairwise
+    difference matrices for both views, sum them, and apply the CoSENT
+    all-pairs penalty:
+
+        joint_diff = diff_A + diff_C   (aligned to same sentence ordering)
+        loss = log(1 + Σ exp(λ · joint_diff[i,j]))   for i < j
+    """
+    def __init__(self, tau, gamma_, lambda_=1.0):
+        super(ChainTriangulationDistillation, self).__init__()
+        self.gamma_ = gamma_
+        self.lambda_ = lambda_
+
+    def forward(self, teacher_top1_sim_pred, student_top1_sim_pred):
+        B = student_top1_sim_pred.size(0)
+        device = student_top1_sim_pred.device
+
+        # Mask diagonal (self-similarity) on teacher
+        diag_mask = torch.eye(B, dtype=torch.bool, device=device)
+        teacher_masked = teacher_top1_sim_pred.clone().masked_fill(diag_mask, float('-inf'))
+
+        # --- View A: each sentence i is the anchor ---
+        _, teacher_order_a = teacher_masked.sort(descending=True, dim=-1)
+        student_sorted_a = torch.gather(student_top1_sim_pred, 1, teacher_order_a)
+
+        # --- Cross-anchor: worst-ranked real sentence per anchor ---
+        # (second-to-last in sorted order; last is the -inf diagonal)
+        cross_anchor_idx = teacher_order_a[:, -2]
+
+        # --- View C: rank from cross-anchor's perspective ---
+        cross_student = student_top1_sim_pred[cross_anchor_idx]
+        # Align to View A's ordering so position k refers to the same sentence
+        student_c_aligned = torch.gather(cross_student, 1, teacher_order_a)
+
+        # --- Pairwise diffs and triangulation ---
+        diff_a = student_sorted_a.unsqueeze(1) - student_sorted_a.unsqueeze(2)
+        diff_c = student_c_aligned.unsqueeze(1) - student_c_aligned.unsqueeze(2)
+        joint_diff = diff_a + diff_c
+
+        # Upper-triangular mask; exclude last row/col (diagonal placeholder)
+        triu_mask = torch.triu(torch.ones(B, B, device=device, dtype=torch.bool), diagonal=1)
+        triu_mask[-1, :] = False
+        triu_mask[:, -1] = False
+
+        scaled = self.lambda_ * joint_diff
+        scaled = scaled.masked_fill(~triu_mask, float('-inf'))
+        # Mask near-zero diffs to avoid spurious exp(0)=1 loss
+        scaled = scaled.masked_fill(torch.abs(joint_diff) < 1e-6, float('-inf'))
+        scaled = torch.clamp(scaled, max=80.0)
+        exp_terms = torch.exp(scaled)
+        loss = torch.log(1 + exp_terms.sum(dim=(1, 2))).mean()
+
+        return self.gamma_ * loss
+
+
 class Pooler(nn.Module):
     """
     Parameter-free poolers to get the sentence embedding
@@ -159,6 +224,8 @@ def cl_init(cls, config):
         cls.distillation_loss_fct = ListNet(cls.model_args.tau2, cls.model_args.gamma_)
     elif cls.model_args.distillation_loss == "listmle":
         cls.distillation_loss_fct = ListMLE(cls.model_args.tau2, cls.model_args.gamma_)
+    elif cls.model_args.distillation_loss == "chain_triangulation":
+        cls.distillation_loss_fct = ChainTriangulationDistillation(cls.model_args.tau2, cls.model_args.gamma_, cls.model_args.distillation_lambda)
     else:
         raise NotImplementedError
     cls.init_weights()
