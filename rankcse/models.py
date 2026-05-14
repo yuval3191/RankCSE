@@ -116,7 +116,7 @@ class ChainTriangulationDistillation(nn.Module):
     For each anchor i in the batch:
       View A: teacher ranks all other sentences relative to anchor i
       View C: teacher ranks all other sentences relative to a cross-anchor c
-              (the sentence ranked LAST by teacher for anchor i)
+              (a mid-ranked sentence per teacher for anchor i)
 
     Both views rank the same candidate set. We reorder the student's
     similarities to match View A's coordinate space, compute pairwise
@@ -143,9 +143,10 @@ class ChainTriangulationDistillation(nn.Module):
         _, teacher_order_a = teacher_masked.sort(descending=True, dim=-1)
         student_sorted_a = torch.gather(student_top1_sim_pred, 1, teacher_order_a)
 
-        # --- Cross-anchor: worst-ranked real sentence per anchor ---
-        # (second-to-last in sorted order; last is the -inf diagonal)
-        cross_anchor_idx = teacher_order_a[:, -2]
+        # --- Cross-anchor: mid-ranked sentence per anchor ---
+        # Analogous to original's "furthest positive" — still somewhat related,
+        # not a total stranger. Position B//2 in the teacher ranking.
+        cross_anchor_idx = teacher_order_a[:, B // 2]
 
         # --- View C: rank from cross-anchor's perspective ---
         cross_student = student_top1_sim_pred[cross_anchor_idx]
