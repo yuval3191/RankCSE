@@ -484,14 +484,16 @@ class CLTrainer(Trainer):
                     num_sent = input_ids.size(1)
 
                     # Flatten input for encoding by the teacher - (bsz * num_sent, len)
-                    input_ids = input_ids.view((-1, input_ids.size(-1))) 
-                    token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) 
+                    input_ids = input_ids.view((-1, input_ids.size(-1)))
+                    if token_type_ids is not None:
+                        token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1)))
                     attention_mask = attention_mask.view((-1, attention_mask.size(-1)))
 
                     teacher_inputs = copy.deepcopy(inputs)
                     teacher_inputs["input_ids"] = input_ids
                     teacher_inputs["attention_mask"] = attention_mask
-                    teacher_inputs["token_type_ids"] = token_type_ids
+                    if token_type_ids is not None:
+                        teacher_inputs["token_type_ids"] = token_type_ids
 
                     # Encode, unflatten, and pass to student
                     if teacher is not None: 
