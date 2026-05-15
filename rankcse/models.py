@@ -126,14 +126,16 @@ class ChainTriangulationDistillation(nn.Module):
         joint_diff = diff_A + diff_C   (aligned to same sentence ordering)
         loss = log(1 + Σ exp(λ · joint_diff[i,j]))   for i < j
     """
-    def __init__(self, tau, gamma_, lambda_=1.0):
+    def __init__(self, tau, gamma_, lambda_=1.0, top_k=16):
         super(ChainTriangulationDistillation, self).__init__()
         self.gamma_ = gamma_
         self.lambda_ = lambda_
+        self.top_k = top_k
 
     def forward(self, teacher_top1_sim_pred, student_top1_sim_pred):
         B = student_top1_sim_pred.size(0)
         device = student_top1_sim_pred.device
+        K = min(self.top_k, B - 1)  # only compare top-K candidates per anchor
 
         # Mask diagonal (self-similarity) on teacher
         diag_mask = torch.eye(B, dtype=torch.bool, device=device)
@@ -141,30 +143,28 @@ class ChainTriangulationDistillation(nn.Module):
 
         # --- View A: each sentence i is the anchor ---
         _, teacher_order_a = teacher_masked.sort(descending=True, dim=-1)
-        student_sorted_a = torch.gather(student_top1_sim_pred, 1, teacher_order_a)
+        # Only keep top-K candidates (like original's 16 positives)
+        teacher_order_topk = teacher_order_a[:, :K]  # (B, K)
+        student_sorted_a = torch.gather(student_top1_sim_pred, 1, teacher_order_topk)  # (B, K)
 
-        # --- Cross-anchor: 16th-ranked sentence per anchor ---
-        cross_anchor_pos = min(15, B - 2)  # safety: don't exceed batch size
-        cross_anchor_idx = teacher_order_a[:, cross_anchor_pos]
+        # --- Cross-anchor: last in top-K (like original's furthest positive) ---
+        cross_anchor_idx = teacher_order_topk[:, -1]  # (B,)
 
         # --- View C: rank from cross-anchor's perspective ---
-        cross_student = student_top1_sim_pred[cross_anchor_idx]
-        # Align to View A's ordering so position k refers to the same sentence
-        student_c_aligned = torch.gather(cross_student, 1, teacher_order_a)
+        cross_student = student_top1_sim_pred[cross_anchor_idx]  # (B, B)
+        # Align to View A's top-K ordering
+        student_c_aligned = torch.gather(cross_student, 1, teacher_order_topk)  # (B, K)
 
         # --- Pairwise diffs and triangulation ---
-        diff_a = student_sorted_a.unsqueeze(1) - student_sorted_a.unsqueeze(2)
-        diff_c = student_c_aligned.unsqueeze(1) - student_c_aligned.unsqueeze(2)
+        diff_a = student_sorted_a.unsqueeze(1) - student_sorted_a.unsqueeze(2)  # (B, K, K)
+        diff_c = student_c_aligned.unsqueeze(1) - student_c_aligned.unsqueeze(2)  # (B, K, K)
         joint_diff = diff_a + diff_c
 
-        # Upper-triangular mask; exclude last row/col (diagonal placeholder)
-        triu_mask = torch.triu(torch.ones(B, B, device=device, dtype=torch.bool), diagonal=1)
-        triu_mask[-1, :] = False
-        triu_mask[:, -1] = False
+        # Upper-triangular mask (K x K, much smaller than B x B)
+        triu_mask = torch.triu(torch.ones(K, K, device=device, dtype=torch.bool), diagonal=1)
 
         scaled = self.lambda_ * joint_diff
         scaled = scaled.masked_fill(~triu_mask, float('-inf'))
-        # Mask near-zero diffs to avoid spurious exp(0)=1 loss
         scaled = scaled.masked_fill(torch.abs(joint_diff) < 1e-6, float('-inf'))
         scaled = torch.clamp(scaled, max=80.0)
         exp_terms = torch.exp(scaled)
