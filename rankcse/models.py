@@ -143,9 +143,8 @@ class ChainTriangulationDistillation(nn.Module):
         _, teacher_order_a = teacher_masked.sort(descending=True, dim=-1)
         student_sorted_a = torch.gather(student_top1_sim_pred, 1, teacher_order_a)
 
-        # --- Cross-anchor: 16th-ranked sentence per anchor ---
-        # Matches our original setup where cross-anchor is the 16th positive.
-        cross_anchor_idx = teacher_order_a[:, 15]
+        # --- Cross-anchor: 8th-ranked sentence per anchor ---
+        cross_anchor_idx = teacher_order_a[:, 7]
 
         # --- View C: rank from cross-anchor's perspective ---
         cross_student = student_top1_sim_pred[cross_anchor_idx]
