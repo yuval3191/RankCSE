@@ -126,11 +126,12 @@ class ChainTriangulationDistillation(nn.Module):
         joint_diff = diff_A + diff_C   (aligned to same sentence ordering)
         loss = log(1 + Σ exp(λ · joint_diff[i,j]))   for i < j
     """
-    def __init__(self, tau, gamma_, lambda_=1.0, top_k=16):
+    def __init__(self, tau, gamma_, lambda_=1.0, top_k=16, ibn_lambda=None):
         super(ChainTriangulationDistillation, self).__init__()
         self.gamma_ = gamma_
         self.lambda_ = lambda_
         self.top_k = top_k
+        self.ibn_lambda = ibn_lambda if ibn_lambda is not None else lambda_
 
     def forward(self, teacher_top1_sim_pred, student_top1_sim_pred):
         B = student_top1_sim_pred.size(0)
@@ -168,9 +169,21 @@ class ChainTriangulationDistillation(nn.Module):
         scaled = scaled.masked_fill(torch.abs(joint_diff) < 1e-6, float('-inf'))
         scaled = torch.clamp(scaled, max=80.0)
         exp_terms = torch.exp(scaled)
-        loss = torch.log(1 + exp_terms.sum(dim=(1, 2))).mean()
+        ranked_loss = torch.log(1 + exp_terms.sum(dim=(1, 2))).mean()
 
-        return self.gamma_ * loss
+        # --- IBN: top-K boundary enforcement ---
+        # Worst candidate in top-K should beat all candidates outside top-K
+        worst_topk_sim = student_sorted_a[:, -1]  # (B,) sim to K-th best
+        teacher_order_outside = teacher_order_a[:, K:]  # (B, B-1-K) indices outside top-K
+        student_outside = torch.gather(student_top1_sim_pred, 1, teacher_order_outside)  # (B, B-1-K)
+
+        # diff = outside_sim - worst_topk_sim; penalize when outside > worst_topk
+        ibn_diff = student_outside - worst_topk_sim.unsqueeze(1)  # (B, B-1-K)
+        ibn_scaled = self.ibn_lambda * ibn_diff
+        ibn_scaled = torch.clamp(ibn_scaled, max=80.0)
+        ibn_loss = torch.log(1 + torch.exp(ibn_scaled).sum(dim=1)).mean()
+
+        return self.gamma_ * (ranked_loss + ibn_loss)
 
 
 class Pooler(nn.Module):
