@@ -58,7 +58,7 @@ class Divergence(nn.Module):
     def forward(self, p: torch.tensor, q: torch.tensor):
         p, q = p.view(-1, p.size(-1)), q.view(-1, q.size(-1))
         m = (0.5 * (p + q)).log().clamp(min=self.eps)
-        return 0.5 * (self.kl(m, p.log()) + self.kl(m, q.log()))
+        return self.beta_ * 0.5 * (self.kl(m, p.log()) + self.kl(m, q.log()))
 
 class ListNet(nn.Module):
     """
