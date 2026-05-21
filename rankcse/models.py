@@ -126,7 +126,7 @@ class ChainTriangulationDistillation(nn.Module):
         joint_diff = diff_A + diff_C   (aligned to same sentence ordering)
         loss = log(1 + Σ exp(λ · joint_diff[i,j]))   for i < j
     """
-    def __init__(self, tau, gamma_, lambda_=1.0, top_k=16, ibn_lambda=None):
+    def __init__(self, tau, gamma_, lambda_=1.0, top_k=32, ibn_lambda=None):
         super(ChainTriangulationDistillation, self).__init__()
         self.gamma_ = gamma_
         self.lambda_ = lambda_
@@ -169,6 +169,9 @@ class ChainTriangulationDistillation(nn.Module):
         scaled = scaled.masked_fill(torch.abs(joint_diff) < 1e-6, float('-inf'))
         scaled = torch.clamp(scaled, max=80.0)
         exp_terms = torch.exp(scaled)
+        positions = torch.arange(K, device=device, dtype=exp_terms.dtype)
+        pos_weight = 1.0 / (positions + 1.0)
+        exp_terms = exp_terms * pos_weight.view(1, K, 1)
         ranked_loss = torch.log(1 + exp_terms.sum(dim=(1, 2))).mean()
 
         # --- IBN: top-K boundary enforcement ---
