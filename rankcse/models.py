@@ -189,6 +189,175 @@ class ChainTriangulationDistillation(nn.Module):
         return self.gamma_ * (ranked_loss + ibn_loss)
 
 
+class ChainTriangulationGreedyPartition(nn.Module):
+    """
+    Greedy list-partitioning variant of ChainTriangulationDistillation.
+
+    Instead of per-anchor top-K from the full batch (each sentence plays many
+    roles), this partitions the batch into mutually-exclusive lists of fixed
+    size:
+
+      Repeat num_lists times:
+          - Pick the first available sentence as the list's anchor.
+          - From the remaining available sentences, take the top-(list_size-1)
+            ranked by teacher similarity to the anchor.
+          - Mark all list_size sentences as used.
+
+    For each list:
+      - View A: anchor → its 15 ranked candidates.
+      - View C: cross_anchor (the last candidate, weakest match) → same 15
+        candidates in the same order.
+      - CoSENT-style ranked loss on the joint pairwise differences.
+      - Optional IBN: list's worst-ranked candidate must beat all sentences
+        outside the list (in other lists).
+
+    All operations within a list are independent of the surrounding batch, so
+    the gradient signal per list is sharper than the diffuse top-K view used
+    by the parent class.
+
+    Args:
+        tau: kept for signature compatibility with sibling distillation losses;
+            not used by the loss (sort is invariant under positive scaling).
+        gamma_: outer scale on the whole loss.
+        lambda_: scale on the pairwise diffs inside the CoSENT log-sum-exp.
+        list_size: number of sentences per list (1 anchor + list_size-1 cands).
+        num_lists: how many lists to extract greedily from the batch.
+        skip_last_n_lists: drop the K weakest lists (their leftover candidates
+            are the least related). 0 = use all.
+        ibn_lambda: scale on the IBN boundary loss. None = same as lambda_.
+        use_ibn: include the cross-list IBN boundary term. Default True.
+    """
+    def __init__(self, tau, gamma_, lambda_=1.0, list_size=16, num_lists=8,
+                 skip_last_n_lists=0, ibn_lambda=None, use_ibn=True):
+        super().__init__()
+        self.gamma_ = gamma_
+        self.lambda_ = lambda_
+        self.list_size = list_size
+        self.num_lists = num_lists
+        self.skip_last_n_lists = skip_last_n_lists
+        self.ibn_lambda = ibn_lambda if ibn_lambda is not None else lambda_
+        self.use_ibn = use_ibn
+
+    @torch.no_grad()
+    def _greedy_partition(self, teacher_sim):
+        """Greedy partition into (num_lists, list_size) sentence indices."""
+        B = teacher_sim.size(0)
+        device = teacher_sim.device
+        L, K = self.num_lists, self.list_size
+
+        if L * K > B:
+            raise ValueError(
+                f"num_lists*list_size ({L}*{K}={L*K}) exceeds batch size {B}"
+            )
+
+        # Mask self-similarity so an anchor doesn't pick itself
+        eye = torch.eye(B, dtype=torch.bool, device=device)
+        ts = teacher_sim.masked_fill(eye, float('-inf'))
+
+        available = torch.ones(B, dtype=torch.bool, device=device)
+        lists = torch.zeros(L, K, dtype=torch.long, device=device)
+        for l in range(L):
+            # Pick anchor: first still-available sentence
+            anchor_idx = torch.nonzero(available, as_tuple=False)[0].item()
+            available[anchor_idx] = False
+            lists[l, 0] = anchor_idx
+
+            # Top-(K-1) most-similar still-available sentences for this anchor
+            sims = ts[anchor_idx].clone()
+            sims[~available] = float('-inf')
+            _, top_idx = sims.topk(K - 1)
+            available[top_idx] = False
+            lists[l, 1:] = top_idx
+        return lists  # (L, K), each row: [anchor, top1, top2, ..., top_{K-1}]
+
+    def forward(self, teacher_top1_sim_pred, student_top1_sim_pred):
+        B = student_top1_sim_pred.size(0)
+        device = student_top1_sim_pred.device
+        L, K = self.num_lists, self.list_size
+
+        list_idx = self._greedy_partition(teacher_top1_sim_pred)  # (L, K)
+
+        # ------------------------------------------------------------------
+        # Build per-list View A and View C in student space.
+        # ------------------------------------------------------------------
+        anchor_ids = list_idx[:, 0]              # (L,)
+        cand_ids = list_idx[:, 1:]               # (L, K-1)  candidates incl. cross-anchor
+        cross_anchor_ids = list_idx[:, -1]       # (L,)  weakest candidate per list
+
+        # View A: anchor_l's student sim to its 15 candidates
+        student_a = student_top1_sim_pred[
+            anchor_ids.unsqueeze(1).expand(-1, K - 1),
+            cand_ids,
+        ]  # (L, K-1)
+
+        # View C: cross_anchor_l's student sim to the same 15 candidates
+        # (note: candidate at position -1 is the cross_anchor itself → self-sim ≈ 1)
+        student_c = student_top1_sim_pred[
+            cross_anchor_ids.unsqueeze(1).expand(-1, K - 1),
+            cand_ids,
+        ]  # (L, K-1)
+
+        # ------------------------------------------------------------------
+        # Decide which lists actually contribute to the loss
+        # ------------------------------------------------------------------
+        L_eff = max(1, L - self.skip_last_n_lists)
+        student_a = student_a[:L_eff]
+        student_c = student_c[:L_eff]
+
+        Kc = K - 1  # number of candidates per list (15 when K=16)
+
+        # ------------------------------------------------------------------
+        # Pairwise diffs → CoSENT-style joint penalty per list
+        # ------------------------------------------------------------------
+        # diff[l, i, j] = student[l, j] - student[l, i]   (sign matches existing
+        # ChainTriangulationDistillation convention via broadcasting).
+        diff_a = student_a.unsqueeze(1) - student_a.unsqueeze(2)   # (L_eff, Kc, Kc)
+        diff_c = student_c.unsqueeze(1) - student_c.unsqueeze(2)
+        joint_diff = diff_a + diff_c
+
+        triu_mask = torch.triu(
+            torch.ones(Kc, Kc, device=device, dtype=torch.bool), diagonal=1
+        )
+
+        scaled = self.lambda_ * joint_diff
+        scaled = scaled.masked_fill(~triu_mask, float('-inf'))
+        scaled = scaled.masked_fill(torch.abs(joint_diff) < 1e-6, float('-inf'))
+        scaled = torch.clamp(scaled, max=80.0)
+        exp_terms = torch.exp(scaled)
+
+        # Position weighting (matches parent class behaviour): better-ranked
+        # candidate (lower i) gets more weight.
+        positions = torch.arange(Kc, device=device, dtype=exp_terms.dtype)
+        pos_weight = 1.0 / (positions + 1.0)
+        exp_terms = exp_terms * pos_weight.view(1, Kc, 1)
+
+        ranked_loss = torch.log(1 + exp_terms.sum(dim=(1, 2))).mean()
+
+        # ------------------------------------------------------------------
+        # IBN: each list's weakest candidate must beat all OUT-OF-LIST sentences
+        # ------------------------------------------------------------------
+        ibn_loss = student_a.new_zeros(())
+        if self.use_ibn:
+            # Mask of sentences NOT in each list (L_eff, B)
+            in_list = torch.zeros(L_eff, B, dtype=torch.bool, device=device)
+            for l in range(L_eff):
+                in_list[l, list_idx[l]] = True
+            out_mask = ~in_list  # True where sentence is outside list l
+
+            # Student sim from each list's anchor to all out-of-list sentences
+            anchor_to_all = student_top1_sim_pred[anchor_ids[:L_eff]]  # (L_eff, B)
+            # Worst-in-list = last candidate (cross_anchor) sim from anchor
+            worst_in_list = student_a[:, -1].unsqueeze(1)  # (L_eff, 1)
+
+            ibn_diff = anchor_to_all - worst_in_list           # (L_eff, B)
+            ibn_diff = ibn_diff.masked_fill(~out_mask, float('-inf'))
+            ibn_scaled = self.ibn_lambda * ibn_diff
+            ibn_scaled = torch.clamp(ibn_scaled, max=80.0)
+            ibn_loss = torch.log(1 + torch.exp(ibn_scaled).sum(dim=1)).mean()
+
+        return self.gamma_ * (ranked_loss + ibn_loss)
+
+
 class Pooler(nn.Module):
     """
     Parameter-free poolers to get the sentence embedding
@@ -242,6 +411,15 @@ def cl_init(cls, config):
         cls.distillation_loss_fct = ListMLE(cls.model_args.tau2, cls.model_args.gamma_)
     elif cls.model_args.distillation_loss == "chain_triangulation":
         cls.distillation_loss_fct = ChainTriangulationDistillation(cls.model_args.tau2, cls.model_args.gamma_, cls.model_args.distillation_lambda)
+    elif cls.model_args.distillation_loss == "chain_triangulation_greedy":
+        cls.distillation_loss_fct = ChainTriangulationGreedyPartition(
+            cls.model_args.tau2,
+            cls.model_args.gamma_,
+            cls.model_args.distillation_lambda,
+            list_size=getattr(cls.model_args, "greedy_list_size", 16),
+            num_lists=getattr(cls.model_args, "greedy_num_lists", 8),
+            skip_last_n_lists=getattr(cls.model_args, "greedy_skip_last", 0),
+        )
     else:
         raise NotImplementedError
     cls.init_weights()

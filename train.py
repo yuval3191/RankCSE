@@ -135,6 +135,18 @@ class ModelArguments:
             "help": "Lambda for CoSENT-style ranking penalty (chain_triangulation loss)."
         }
     )
+    greedy_list_size: int = field(
+        default=16,
+        metadata={"help": "Size of each list (1 anchor + L-1 candidates) for chain_triangulation_greedy."}
+    )
+    greedy_num_lists: int = field(
+        default=8,
+        metadata={"help": "Number of lists to extract per batch for chain_triangulation_greedy."}
+    )
+    greedy_skip_last: int = field(
+        default=0,
+        metadata={"help": "Drop the N weakest greedy lists from the loss (their leftover candidates are noisier)."}
+    )
 
 
     # SimCSE's arguments
